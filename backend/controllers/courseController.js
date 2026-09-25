@@ -1,0 +1,431 @@
+import { Course, Module, Lesson, LessonContent } from "../models/modelAssociations.js";
+
+/* =========================
+   HELPERS
+========================= */
+
+const parseLessonsCount = (lessons) => {
+  if (typeof lessons !== "string") return 0;
+
+  try {
+    if (lessons.includes(" of ")) {
+      const value = parseInt(lessons.split(" of ")[1], 10);
+      return Number.isNaN(value) ? 0 : value;
+    }
+
+    const value = parseInt(lessons.split(" ")[0], 10);
+    return Number.isNaN(value) ? 0 : value;
+  } catch {
+    return 0;
+  }
+};
+
+const formatCourse = (course) => ({
+  id: course.id,
+  title: course.title,
+  category: course.category,
+  categoryColor: course.categoryColor,
+  level: course.level,
+  lessons: course.lessons,
+  lessonsCount: course.lessonsCount ?? parseLessonsCount(course.lessons),
+  price: course.price,
+  priceValue: course.priceValue,
+  currency: course.currency,
+  rating: course.rating,
+  students: course.students,
+  studentsCount: course.studentsCount,
+  image: course.image,
+  isBookmarked: course.isBookmarked,
+});
+
+const getCourses = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 10;
+    
+    const sanitizedPage = page > 0 ? page : 1;
+    const sanitizedLimit = limit > 0 ? limit : 10;
+    const offset = (sanitizedPage - 1) * sanitizedLimit;
+
+    const { rows } = await Course.findAndCountAll({
+      where: { status: "published" },
+      order: [["createdAt", "ASC"]],
+      limit: sanitizedLimit,
+      offset: offset,
+    });
+
+    // Directly return the mapped array so the frontend doesn't break
+    res.json(rows.map(formatCourse));
+    
+  } catch (error) {
+    console.error("GET COURSES ERROR:", error);
+    res.status(500).json({ message: "Failed to load courses" });
+  }
+};
+
+const getCourseById = async (req, res) => {
+  try {
+    const courseId = String(req.params.id);
+
+    const course = await Course.findByPk(courseId);
+
+    if (!course) {
+      return res.status(404).json({ message: "Course not found" });
+    }
+
+    // Block access to disabled/deleted courses — NO exceptions
+    if (course.status !== "published") {
+      return res.status(403).json({ message: "This course is not currently available." });
+    }
+
+    res.json(formatCourse(course));
+  } catch (error) {
+    console.error("GET COURSE BY ID ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+/* =========================
+   GET MY COURSES (DB)
+========================= */
+const getMyCourses = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.json([]);
+    }
+
+    const purchasedIds =
+      req.user.purchasedCourses?.map((c) => String(c.courseId)) || [];
+
+    if (purchasedIds.length === 0) {
+      return res.json([]);
+    }
+
+    const myCourses = await Course.findAll({
+      where: {
+        id: purchasedIds,
+        status: "published",
+      },
+      order: [["createdAt", "ASC"]],
+    });
+
+    res.json(
+      myCourses.map((course) => ({
+        id: course.id,
+        title: course.title,
+        category: course.category,
+        level: course.level,
+        lessons: course.lessons,
+        lessonsCount: course.lessonsCount ?? parseLessonsCount(course.lessons),
+        image: course.image,
+      }))
+    );
+  } catch (error) {
+    console.error("MY COURSES ERROR:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch your courses. Please try again.",
+    });
+  }
+};
+
+/* =========================
+   GET COURSE LEARNING DATA (DB)
+========================= */
+const getCourseLearningData = async (req, res) => {
+  try {
+    const courseId = String(req.params.id);
+
+    const course = await Course.findByPk(courseId);
+
+    if (!course) {
+      return res.status(404).json({ message: "Learning data not found" });
+    }
+
+    // Disabled = completely blocked for ALL users, including enrolled
+    if (course.status === "disabled") {
+      return res.status(403).json({ message: "This course is currently disabled." });
+    }
+
+    // Deleted = not found
+    if (course.status === "deleted") {
+      return res.status(404).json({ message: "Learning data not found" });
+    }
+// Check if user purchased/enrolled in the course
+const purchasedCourses =
+  req.user.purchasedCourses?.map((c) => String(c.courseId)) || [];
+
+const hasAccess = purchasedCourses.includes(String(course.id));
+
+const priceValue = parseFloat(course.priceValue) || 0;
+const isFreeOrOne = priceValue <= 1;
+
+if (!hasAccess && req.user.role !== "admin" && !isFreeOrOne) {
+  return res.status(403).json({
+    message: "Access denied. Please purchase/enroll in this course.",
+  });
+}
+ 
+    const modules = await Module.findAll({
+      where: { courseId },
+      order: [["order", "ASC"], ["createdAt", "ASC"]],
+    });
+
+    const formattedModules = await Promise.all(
+      modules.map(async (module) => {
+        const lessons = await Lesson.findAll({
+          where: { moduleId: module.id },
+          include: [
+            {
+              model: LessonContent,
+              as: "content",
+              required: false,
+            },
+          ],
+          order: [["order", "ASC"], ["createdAt", "ASC"]],
+        });
+
+        return {
+          id: module.id,
+          title: module.title,
+          lessons: lessons.map((lesson) => ({
+            id: lesson.id,
+            title: lesson.title,
+            duration: lesson.duration,
+            completed: lesson.completed,
+            playing: lesson.playing,
+            type: lesson.type,
+            youtubeUrl: lesson.youtubeUrl,
+            videoUrl: lesson.videoUrl,
+            content: lesson.content
+              ? {
+                introduction: lesson.content.introduction,
+                keyConcepts: lesson.content.keyConcepts,
+              }
+              : undefined,
+          })),
+        };
+      })
+    );
+
+    let currentLesson = null;
+
+    for (const module of formattedModules) {
+      const firstLesson = module.lessons?.[0];
+      if (firstLesson) {
+        currentLesson = {
+          ...firstLesson,
+          module: module.title,
+        };
+        break;
+      }
+    }
+
+    res.json({
+      modules: formattedModules,
+      course: {
+        id: course.id,
+        title: course.title,
+        subtitle: course.category,
+        logo: course.image,
+        progress: 0,
+      },
+      currentLesson,
+    });
+  } catch (error) {
+    console.error("GET COURSE LEARNING DATA ERROR:", error);
+    res.status(500).json({ message: "Failed to load learning data" });
+  }
+};
+
+/* =================================
+   GET COURSE AND LESSON TITLES
+===================================== */
+const getCourseAndLessonTitles = async (courseId, lessonId) => {
+  try {
+    const course = await Course.findByPk((courseId));
+    const lesson = await Lesson.findByPk((lessonId));
+
+    if (!course || !lesson) return null;
+
+    return {
+      courseTitle: course.title || null,
+      lessonTitle: lesson.title || null,
+    };
+  } catch (error) {
+    console.error("Error reading course/lesson titles:", error);
+    return null;
+  }
+};
+
+/* =========================
+   GET STATS CARDS (DB)
+========================= */
+const getStatsCards = async (req, res) => {
+  try {
+    const totalCourses = await Course.count({ where: { status: "published" } });
+
+    res.json({
+      totalCourses,
+      completedCourses: 0,
+      hoursLearned: 0,
+      certificates: 0,
+    });
+  } catch (error) {
+    console.error("GET STATS CARDS ERROR:", error);
+    res.status(500).json({ message: "Failed to load stats" });
+  }
+};
+
+/* =========================
+   ADMIN STUBS (UNCHANGED)
+========================= */
+const addCourse = async (req, res) => {
+  try {
+    const course = await Course.create({
+      ...req.body,
+      status: "published",
+    });
+    res.status(201).json(course);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to add course", error: error.message });
+  }
+};
+
+const deleteCourse = async (req, res) => {
+  try {
+    const deletedCount = await Course.destroy({ where: { id: req.params.id } });
+    if (deletedCount === 0) {
+      return res.status(404).json({ message: "Course not found" });
+    }
+    res.json({ message: "Course deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to delete course" });
+  }
+};
+
+const updateLessonVideo = async (req, res) => {
+  res.status(501).json({ message: "updateLessonVideo not implemented" });
+};
+
+const addSubtopics = async (req, res) => {
+  res.status(501).json({ message: "addSubtopics not implemented" });
+};
+
+const addLessons = async (req, res) => {
+  try {
+    const { courseId, moduleId } = req.params;
+    const { lessons } = req.body;
+    
+    // Auto-increment order
+    const maxOrder = await Lesson.max('order', { where: { moduleId } }) || 0;
+    
+    const createdLessons = await Promise.all(lessons.map((l, index) => 
+      Lesson.create({
+        moduleId,
+        title: l.title,
+        duration: l.duration || "5 mins",
+        type: l.type || "video",
+        order: maxOrder + index + 1
+      })
+    ));
+
+    res.status(201).json(createdLessons);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to add lessons" });
+  }
+};
+
+const addModules = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    const { modules } = req.body;
+
+    const maxOrder = await Module.max('order', { where: { courseId } }) || 0;
+
+    const createdModules = await Promise.all(modules.map((m, index) => 
+      Module.create({
+        courseId,
+        title: m.title,
+        order: maxOrder + index + 1
+      })
+    ));
+
+    res.status(201).json(createdModules);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to add modules" });
+  }
+};
+
+const generateCourseSyllabusWithAI = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const course = await Course.findByPk(id);
+    if (!course) return res.status(404).json({ message: "Course not found" });
+
+    // 1. Call Python AI Service
+    const aiResponse = await fetch(`${process.env.AI_SERVICE_URL}/generate-syllabus`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        course_title: course.title,
+        category: course.category
+      }),
+    });
+
+    if (!aiResponse.ok) {
+      return res.status(500).json({ message: "AI Service failed to generate syllabus" });
+    }
+
+    const data = await aiResponse.json();
+    if (data.error) {
+       return res.status(500).json({ message: data.error });
+    }
+
+    // 2. Insert into DB
+    let moduleOrder = 1;
+    for (const mod of data.modules) {
+      const newModule = await Module.create({
+        courseId: course.id,
+        title: mod.title,
+        order: moduleOrder++
+      });
+
+      let lessonOrder = 1;
+      for (const les of mod.lessons) {
+        await Lesson.create({
+          moduleId: newModule.id,
+          title: les.title,
+          duration: les.duration || "5 mins",
+          type: les.type || "video",
+          order: lessonOrder++
+        });
+      }
+    }
+
+    res.json({ message: "Syllabus generated successfully", data: data });
+
+  } catch (error) {
+    console.error("GENERATE SYLLABUS ERROR:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+/* =========================
+   EXPORTS
+========================= */
+export {
+  getCourses,
+  getCourseById,
+  getCourseLearningData,
+  getCourseAndLessonTitles,
+  getStatsCards,
+  getMyCourses,
+  addCourse,
+  deleteCourse,
+  updateLessonVideo,
+  addSubtopics,
+  addLessons,
+  addModules,
+  generateCourseSyllabusWithAI,
+};
