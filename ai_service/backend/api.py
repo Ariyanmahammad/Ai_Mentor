@@ -358,6 +358,9 @@ def process_lesson(data: LessonRequest, base_filename: str):
 
             print(f"❌ TTS Error: {e}")
 
+            job_status[base_filename] = {
+                "status": "failed"
+            }
             return
 
         # 5️⃣ Select Video
@@ -366,6 +369,9 @@ def process_lesson(data: LessonRequest, base_filename: str):
 
         if not os.path.exists(input_video):
             print(f"❌ Error: Video file not found at {input_video}")
+            job_status[base_filename] = {
+                "status": "failed"
+            }
             return
 
         # 6️⃣ Merge Video + Audio (FFmpeg)
